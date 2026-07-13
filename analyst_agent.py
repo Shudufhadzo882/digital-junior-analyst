@@ -275,7 +275,10 @@ def build_analyst_agent(api_key: str, store, temperature: float = 0.1):
 # Direct RAG fallback (simpler, always works)
 # ---------------------------------------------------------------------------
 
-def generate_report_direct(query: str, api_key: str, store) -> str:
+# Direct RAG fallback (simpler, always works)
+# ---------------------------------------------------------------------------
+
+def generate_report_direct(query: str, api_key: str, store, context: Optional[str] = None) -> str:
     """
     Directly call Gemini with RAG context — no agent overhead.
     Used as fallback if the ReAct agent fails.
@@ -283,7 +286,8 @@ def generate_report_direct(query: str, api_key: str, store) -> str:
     from langchain_google_genai import ChatGoogleGenerativeAI
     from langchain_core.messages import HumanMessage, SystemMessage
 
-    context = rag_retrieval(query, store, k=6)
+    if context is None:
+        context = rag_retrieval(query, store, k=6)
 
     llm = ChatGoogleGenerativeAI(
         model="gemini-3.1-flash-lite",
@@ -322,11 +326,30 @@ def run_analyst(
     status_callback=None,
 ) -> Dict[str, Any]:
     """
-    Main entry point for generating a risk report.
+    Main entry point for generating a risk report with full database telemetry.
 
     Returns:
-        Dict with keys: 'report', 'sources', 'intermediate_steps', 'method'
+        Dict with keys: 'session_id', 'report', 'sources', 'intermediate_steps', 'method'
     """
+    import uuid
+    import time
+    from datetime import datetime
+    from telemetry import enqueue_telemetry, TelemetryCallbackHandler, log_manual_telemetry
+
+    session_id = str(uuid.uuid4())
+    start_time = time.time()
+    now_iso = datetime.utcnow().isoformat() + "Z"
+    initial_method = "agent" if use_agent else "direct"
+
+    # 1. Enqueue Session Start
+    enqueue_telemetry({
+        "type": "session_start",
+        "session_id": session_id,
+        "query": query,
+        "timestamp": now_iso,
+        "method": initial_method
+    })
+
     if status_callback:
         status_callback("🔍 Retrieving relevant documents from knowledge base...")
 
@@ -345,49 +368,92 @@ def run_analyst(
         ]
 
     intermediate_steps = []
-    method = "direct"
+    method = initial_method
     report = ""
 
-    if use_agent:
-        try:
-            if status_callback:
-                status_callback("🤖 Initializing ReAct analyst agent...")
-            executor = build_analyst_agent(api_key, store)
+    try:
+        if use_agent:
+            try:
+                if status_callback:
+                    status_callback("🤖 Initializing ReAct analyst agent...")
+                executor = build_analyst_agent(api_key, store)
 
-            if status_callback:
-                status_callback("⚡ Agent is reasoning step-by-step (multi-tool)...")
+                if status_callback:
+                    status_callback("⚡ Agent is reasoning step-by-step (multi-tool)...")
 
-            result = executor.invoke(
-                {"input": REPORT_PROMPT_TEMPLATE.format(query=query)}
-            )
-            report = result.get("output", "")
-            intermediate_steps = result.get("intermediate_steps", [])
-            method = "agent"
+                # Setup telemetry callback
+                handler = TelemetryCallbackHandler(session_id=session_id)
+                result = executor.invoke(
+                    {"input": REPORT_PROMPT_TEMPLATE.format(query=query)},
+                    config={"callbacks": [handler]}
+                )
+                report = result.get("output", "")
+                intermediate_steps = result.get("intermediate_steps", [])
+                method = "agent"
+
+                if status_callback:
+                    status_callback("✅ Report synthesis complete.")
+
+            except Exception as e:
+                method = "direct_fallback"
+                if status_callback:
+                    status_callback(
+                        f"⚠️ Agent hit an issue ({type(e).__name__}). "
+                        f"Falling back to direct RAG synthesis..."
+                    )
+                
+                # Fetch RAG context and run direct synthesis
+                context = rag_retrieval(query, store, k=6)
+                report = generate_report_direct(query, api_key, store, context=context)
+                
+                # Log manual telemetry for fallback
+                run_latency = time.time() - start_time
+                log_manual_telemetry(session_id, query, context, report, run_latency, "SUCCESS", "direct_fallback")
+
+                if status_callback:
+                    status_callback("✅ Report generated via direct RAG fallback.")
+        else:
+            if status_callback:
+                status_callback("⚡ Generating report via RAG synthesis (direct mode)...")
+            
+            context = rag_retrieval(query, store, k=6)
+            report = generate_report_direct(query, api_key, store, context=context)
+            method = "direct"
+
+            # Log manual telemetry for direct run
+            run_latency = time.time() - start_time
+            log_manual_telemetry(session_id, query, context, report, run_latency, "SUCCESS", "direct")
 
             if status_callback:
                 status_callback("✅ Report synthesis complete.")
 
-        except Exception as e:
-            if status_callback:
-                status_callback(
-                    f"⚠️ Agent hit an issue ({type(e).__name__}). "
-                    f"Falling back to direct RAG synthesis..."
-                )
-            report = generate_report_direct(query, api_key, store)
-            method = "direct_fallback"
-            if status_callback:
-                status_callback("✅ Report generated via direct RAG.")
-    else:
-        if status_callback:
-            status_callback("⚡ Generating report via RAG synthesis (direct mode)...")
-        report = generate_report_direct(query, api_key, store)
-        method = "direct"
-        if status_callback:
-            status_callback("✅ Report synthesis complete.")
+        # 2. Enqueue Session End (Success)
+        session_latency = time.time() - start_time
+        enqueue_telemetry({
+            "type": "session_end",
+            "session_id": session_id,
+            "latency": session_latency,
+            "status": "SUCCESS",
+            "final_report": report
+        })
+
+    except Exception as total_error:
+        # Enqueue Session End (Failure)
+        session_latency = time.time() - start_time
+        enqueue_telemetry({
+            "type": "session_end",
+            "session_id": session_id,
+            "latency": session_latency,
+            "status": "FAILED",
+            "final_report": f"Process failed: {str(total_error)}"
+        })
+        raise total_error
 
     return {
+        "session_id": session_id,
         "report": report,
         "sources": sources,
         "intermediate_steps": intermediate_steps,
         "method": method,
     }
+

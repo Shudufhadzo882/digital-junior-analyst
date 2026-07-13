@@ -386,6 +386,13 @@ with st.sidebar:
             unsafe_allow_html=True,
         )
 
+    # Initialize observability & evaluator workers
+    from telemetry import start_telemetry_worker
+    from evaluator import start_evaluator_worker
+    start_telemetry_worker()
+    if api_key:
+        start_evaluator_worker(api_key)
+
     st.markdown("---")
 
     # Knowledge Base section
@@ -528,11 +535,12 @@ if "query_text" not in st.session_state:
 # ---------------------------------------------------------------------------
 # MAIN TABS
 # ---------------------------------------------------------------------------
-tab_report, tab_sources, tab_risk_matrix, tab_agent_log = st.tabs([
+tab_report, tab_sources, tab_risk_matrix, tab_agent_log, tab_command_center = st.tabs([
     "⚡ Instant Report",
     "📄 Source Documents",
     "📊 Risk Matrix",
     "🔬 Agent Reasoning Log",
+    "📡 Telemetry Command Center",
 ])
 
 # ===========================================================================
@@ -897,3 +905,240 @@ with tab_agent_log:
                     f'</div>',
                     unsafe_allow_html=True,
                 )
+
+
+# ===========================================================================
+# TAB 5: TELEMETRY COMMAND CENTER
+# ===========================================================================
+with tab_command_center:
+    import sqlite3
+    from datetime import datetime
+    
+    db_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "telemetry.db")
+    
+    if not os.path.exists(db_file):
+        st.markdown(
+            '<div class="card card-amber" style="text-align:center;padding:2.5rem;">'
+            '<div style="font-size:1.5rem;margin-bottom:0.5rem;">📡</div>'
+            '<div style="font-weight:600;margin-bottom:0.25rem;">Telemetry database is empty</div>'
+            '<div style="font-size:0.82rem;color:var(--text-muted);">Execute queries on the "Instant Report" tab first to generate telemetry records.</div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        # DB connection
+        conn = sqlite3.connect(db_file)
+        sessions_df = pd.read_sql_query("SELECT * FROM sessions ORDER BY timestamp DESC", conn)
+        runs_df = pd.read_sql_query("SELECT * FROM agent_runs", conn)
+        tools_df = pd.read_sql_query("SELECT * FROM tool_invocations", conn)
+        conn.close()
+        
+        if sessions_df.empty:
+            st.markdown(
+                '<div class="card card-amber" style="text-align:center;padding:2.5rem;">'
+                '<div style="font-size:1.5rem;margin-bottom:0.5rem;">📡</div>'
+                '<div style="font-weight:600;margin-bottom:0.25rem;">No telemetry sessions found</div>'
+                '<div style="font-size:0.82rem;color:var(--text-muted);">Please generate a report to log telemetry data.</div>'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            # 1. Global KPIs
+            st.markdown('<div style="font-weight:600;font-size:1rem;margin-bottom:0.75rem;">📡 Observability Analytics</div>', unsafe_allow_html=True)
+            kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+            
+            total_sessions = len(sessions_df)
+            success_sessions = len(sessions_df[sessions_df["status"] == "SUCCESS"])
+            fail_sessions = total_sessions - success_sessions
+            success_rate = (success_sessions / total_sessions) * 100 if total_sessions > 0 else 0
+            
+            avg_session_latency = sessions_df["latency"].mean() if not sessions_df["latency"].isnull().all() else 0.0
+            
+            # Evaluations
+            evaluated_runs = runs_df[~runs_df["eval_hallucination_score"].isnull()]
+            avg_hallucination = evaluated_runs["eval_hallucination_score"].mean() if not evaluated_runs.empty else 0.0
+            avg_relevance = evaluated_runs["eval_relevance_score"].mean() if not evaluated_runs.empty else 0.0
+            
+            with kpi1:
+                kpi_card("Total Sessions", f"{total_sessions}", f"Success Rate: {success_rate:.1f}%", "accent")
+            with kpi2:
+                kpi_card("Avg Session Latency", f"{avg_session_latency:.2f}s", f"Successful: {success_sessions} / Failed: {fail_sessions}", "green" if fail_sessions==0 else "amber")
+            with kpi3:
+                kpi_card("Avg Hallucination Score", f"{avg_hallucination:.1f}/100", f"Evaluated Runs: {len(evaluated_runs)}", "green" if avg_hallucination < 15 else ("amber" if avg_hallucination < 40 else "red"))
+            with kpi4:
+                kpi_card("Avg Context Relevance", f"{avg_relevance:.1f}/100", f"Target goal: > 80.0", "green" if avg_relevance > 80 else "amber")
+                
+            st.markdown("---")
+            
+            # 2. Main layout: Columns
+            col_list, col_detail = st.columns([1, 1])
+            
+            with col_list:
+                st.markdown('<div style="font-weight:600;font-size:0.85rem;margin-bottom:0.5rem;">📁 Session History Logs</div>', unsafe_allow_html=True)
+                
+                # Selection dropdown
+                session_options = sessions_df["session_id"].tolist()
+                
+                def format_session_option(sid):
+                    row = sessions_df[sessions_df["session_id"] == sid]
+                    q = row["query"].values[0] if not row.empty else "Unknown"
+                    m = row["method"].values[0] if not row.empty else "Unknown"
+                    s = row["status"].values[0] if not row.empty else "Unknown"
+                    ts = row["timestamp"].values[0] if not row.empty else "Unknown"
+                    try:
+                        ts_parsed = datetime.fromisoformat(ts.replace("Z", "")).strftime("%H:%M:%S")
+                    except:
+                        ts_parsed = ts[:10]
+                    return f"[{ts_parsed}] [{s}] {q[:45]}... ({m})"
+                
+                selected_session_id = st.selectbox(
+                    "Select Session to Audit",
+                    options=session_options,
+                    format_func=format_session_option,
+                    key="telemetry_session_selector"
+                )
+                
+                # Sessions dataframe
+                sessions_table_df = sessions_df.copy()
+                sessions_table_df["short_query"] = sessions_table_df["query"].apply(lambda x: x[:50] + "..." if len(x) > 50 else x)
+                sessions_table_df["time"] = sessions_table_df["timestamp"].apply(lambda x: x[11:19] if len(x) > 19 else x)
+                sessions_table_df = sessions_table_df[["session_id", "time", "short_query", "latency", "method", "status"]]
+                
+                st.dataframe(
+                    sessions_table_df,
+                    use_container_width=True,
+                    column_config={
+                        "session_id": st.column_config.TextColumn("Session ID", width=70),
+                        "time": st.column_config.TextColumn("Time", width=70),
+                        "short_query": st.column_config.TextColumn("User Query"),
+                        "latency": st.column_config.NumberColumn("Latency (s)", format="%.2fs", width=70),
+                        "method": st.column_config.TextColumn("Method", width=80),
+                        "status": st.column_config.TextColumn("Status", width=80),
+                    },
+                    hide_index=True,
+                )
+                
+                # Quality Trends Chart
+                st.markdown('<div style="height:1.5rem;"></div>', unsafe_allow_html=True)
+                st.markdown('<div style="font-weight:600;font-size:0.85rem;margin-bottom:0.5rem;">📈 Historical Quality Trends</div>', unsafe_allow_html=True)
+                
+                eval_runs_sorted = runs_df[~runs_df["eval_hallucination_score"].isnull()].sort_values("start_time")
+                if not eval_runs_sorted.empty:
+                    fig_trend = px.line(
+                        eval_runs_sorted,
+                        x="start_time",
+                        y=["eval_hallucination_score", "eval_relevance_score"],
+                        labels={"value": "Score", "start_time": "Execution Time", "variable": "Metric"},
+                        color_discrete_map={
+                            "eval_hallucination_score": "#ef4444",
+                            "eval_relevance_score": "#22c55e"
+                        }
+                    )
+                    fig_trend.update_layout(
+                        **PLOT_LAYOUT,
+                        height=200,
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0.5, xanchor="center")
+                    )
+                    st.plotly_chart(fig_trend, use_container_width=True, config={"displayModeBar": False})
+                else:
+                    st.info("No evaluations run yet. Quality trend chart will populate once Gemini evaluator analyzes agent runs.")
+                    
+            with col_detail:
+                st.markdown('<div style="font-weight:600;font-size:0.85rem;margin-bottom:0.5rem;">🔍 Detailed Audit Inspector</div>', unsafe_allow_html=True)
+                
+                if selected_session_id:
+                    session_row = sessions_df[sessions_df["session_id"] == selected_session_id].iloc[0]
+                    
+                    status_lbl = "badge-low" if session_row["status"] == "SUCCESS" else "badge-critical"
+                    st.markdown(
+                        f'<div class="card card-accent">'
+                        f'<div style="font-size:0.75rem;color:var(--text-muted);">Session ID: {session_row["session_id"]}</div>'
+                        f'<div style="font-weight:600;font-size:0.95rem;margin:4px 0 6px;">Query: {session_row["query"]}</div>'
+                        f'<div style="display:flex;gap:0.75rem;align-items:center;font-size:0.78rem;">'
+                        f'  <span>Status: <span class="badge {status_lbl}">{session_row["status"]}</span></span>'
+                        f'  <span>Latency: <strong>{session_row["latency"]:.2f}s</strong></span>'
+                        f'  <span>Method: <span class="badge badge-purple">{session_row["method"]}</span></span>'
+                        f'</div>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+                    
+                    # Agent runs for this session
+                    session_runs = runs_df[runs_df["session_id"] == selected_session_id]
+                    
+                    if session_runs.empty:
+                        st.info("No agent runs logged for this session.")
+                    else:
+                        st.markdown('<div style="font-size:0.8rem;font-weight:600;color:var(--text-muted);margin:0.8rem 0 0.4rem;">AGENT RUNS</div>', unsafe_allow_html=True)
+                        
+                        for _, run in session_runs.iterrows():
+                            # Run Info Card
+                            run_id = run["agent_run_id"]
+                            st.markdown(
+                                f'<div class="card" style="border-left: 3px solid var(--purple); background: var(--bg-subtle);">'
+                                f'<div style="display:flex;justify-content:space-between;align-items:flex-start;">'
+                                f'  <div>'
+                                f'    <div style="font-weight:600;font-size:0.88rem;color:var(--text);">🤖 {run["agent_name"]}</div>'
+                                f'    <div style="font-size:0.72rem;color:var(--text-muted);">Run ID: {run_id}  ·  Latency: {run["latency"]:.2f}s</div>'
+                                f'  </div>'
+                                f'  <span class="badge badge-purple">{run["status"]}</span>'
+                                f'</div>'
+                                f'</div>',
+                                unsafe_allow_html=True,
+                            )
+                            
+                            # LLM Judge Evaluator outcomes
+                            if pd.isnull(run["eval_hallucination_score"]):
+                                st.markdown(
+                                    '<div class="card card-amber" style="font-size:0.78rem;padding:0.6rem 0.9rem;">'
+                                    '⏳ <strong>Gemini Evaluator</strong>: Evaluation is pending or processing in background thread...</div>',
+                                    unsafe_allow_html=True,
+                                )
+                            else:
+                                h_score = run["eval_hallucination_score"]
+                                r_score = run["eval_relevance_score"]
+                                
+                                h_badge = "badge-low" if h_score < 15 else ("badge-high" if h_score < 40 else "badge-critical")
+                                r_badge = "badge-low" if r_score > 80 else ("badge-high" if r_score > 50 else "badge-critical")
+                                
+                                st.markdown(
+                                    f'<div class="card" style="border-left: 3px solid var(--accent);">'
+                                    f'<div style="font-size:0.76rem;font-weight:600;color:var(--text-muted);text-transform:uppercase;margin-bottom:6px;">⚖️ LLM-AS-A-JUDGE EVALUATION</div>'
+                                    f'<div style="display:flex;gap:1rem;margin-bottom:6px;">'
+                                    f'  <div style="font-size:0.75rem;">Hallucination Score: <span class="badge {h_badge}">{h_score}/100</span></div>'
+                                    f'  <div style="font-size:0.75rem;">Context Relevance: <span class="badge {r_badge}">{r_score}/100</span></div>'
+                                    f'</div>'
+                                    f'<div style="font-size:0.78rem;color:var(--text);background:var(--bg-subtle);padding:0.5rem 0.7rem;border-radius:5px;line-height:1.5;">'
+                                    f'  <strong>Feedback</strong>: {run["eval_feedback"]}'
+                                    f'</div>'
+                                    f'<div style="font-size:0.68rem;color:var(--text-dim);margin-top:4px;">Evaluated at: {run["eval_timestamp"]}</div>'
+                                    f'</div>',
+                                    unsafe_allow_html=True,
+                                )
+                            
+                            # Tool Invocations for this run
+                            run_tools = tools_df[tools_df["agent_run_id"] == run_id]
+                            if not run_tools.empty:
+                                with st.expander(f"🛠️ Tool Invocations ({len(run_tools)})", expanded=False):
+                                    for _, tool in run_tools.iterrows():
+                                        tool_status_lbl = "badge-low" if tool["status"] == "SUCCESS" else "badge-critical"
+                                        st.markdown(
+                                            f'<div style="padding:0.6rem 0.8rem;border-bottom:1px solid var(--border);font-size:0.76rem;background:var(--card);border-radius:6px;margin-bottom:6px;">'
+                                            f'  <div style="display:flex;justify-content:space-between;margin-bottom:4px;">'
+                                            f'    <strong>🔧 {tool["tool_name"]}</strong>'
+                                            f'    <span class="badge {tool_status_lbl}">{tool["status"]} ({tool["latency"]:.2f}s)</span>'
+                                            f'  </div>'
+                                            f'  <div style="color:var(--text-muted);font-family:monospace;font-size:0.7rem;margin-bottom:4px;">Input: {tool["tool_input"]}</div>'
+                                            f'  <div style="background:var(--bg-subtle);border-radius:4px;padding:0.4rem;max-height:120px;overflow-y:auto;font-family:monospace;font-size:0.7rem;color:var(--text-dim);white-space:pre-wrap;">Output: {tool["tool_output"][:800]}</div>'
+                                            f'</div>',
+                                            unsafe_allow_html=True,
+                                        )
+                                        
+                    # Final report output collapsible
+                    if session_row["final_report"]:
+                        with st.expander("📝 Show Generated Final Report", expanded=False):
+                            st.markdown(
+                                f'<div class="report-output" style="max-height:400px;font-size:0.84rem;">{session_row["final_report"]}</div>',
+                                unsafe_allow_html=True,
+                            )
+
